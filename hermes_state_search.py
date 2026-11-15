@@ -27,6 +27,7 @@ from hermes_state_fts import fts_layout_current, fts_layout_drift
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
+_SEARCH_DEADLINE = contextvars.ContextVar("session_search_deadline", default=None)
 
 
 @dataclass
@@ -241,14 +242,16 @@ def _positive_int(name: str, value: Any) -> None:
         raise ValueError(f"{name} must be greater than zero")
 
 
-def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_by: str, limit_sql: str) -> str:
+def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_by: str, limit_sql: str,
+                       *, sessions_first: bool = False) -> str:
     """Result-row SELECT shared by the FTS and LIKE routes (SQL text is pinned)."""
+    joined = ("sessions s CROSS JOIN messages m ON s.id = m.session_id" if sessions_first
+              else f"{from_sql} JOIN sessions s ON s.id = m.session_id")
     return f"""
             SELECT m.id, m.session_id, m.role,
                    {snippet_sql},
                    {_SEARCH_SELECT_TAIL}
-            FROM {from_sql}
-            JOIN sessions s ON s.id = m.session_id
+            FROM {joined}
             WHERE {' AND '.join(where)}
             {order_by}
             {limit_sql}
@@ -1017,6 +1020,28 @@ class SessionSearchMixin:
 
     # ── Query builders / runners ───────────────────────────────────────────
 
+    def _search_read_all(self, sql: str, params: Any = ()) -> list[sqlite3.Row]:
+        """Cancel expensive search SQL on its own reader, never the gateway's other work."""
+        deadline = _SEARCH_DEADLINE.get()
+        if deadline is None:
+            return self._read_all(sql, params)
+        with self._read_ctx() as conn:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Session search exceeded its time budget")
+            busy_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            conn.execute(f"PRAGMA busy_timeout = {min(busy_ms, max(1, int(remaining * 1000)))}")
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            try:
+                return conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError as exc:
+                if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT or time.monotonic() >= deadline:
+                    raise TimeoutError("Session search exceeded its time budget") from exc
+                raise
+            finally:
+                conn.set_progress_handler(None, 0)
+                conn.execute(f"PRAGMA busy_timeout = {busy_ms}")
+
     @staticmethod
     def _fts_match_sql(table: str, match_query: str, order_by_sql: str, *, limit: int, offset: int,
                        **filters) -> tuple[str, list]:
@@ -1040,7 +1065,7 @@ class SessionSearchMixin:
         search never runs the unbounded rebuild. Other ``DatabaseError``s propagate."""
         sql, params = self._fts_match_sql(table, match_query, order_by_sql, **kwargs)
         try:
-            return [dict(row) for row in self._read_all(sql, params)]
+            return [dict(row) for row in self._search_read_all(sql, params)]
         except sqlite3.OperationalError:
             if operational_debug:
                 logger.debug(operational_debug, exc_info=True)
@@ -1055,8 +1080,11 @@ class SessionSearchMixin:
 
     def _like_rows(self, where: list[str], params: list, *, order_by: str, limit_sql: str) -> list[dict[str, Any]]:
         """Canonical-table LIKE scan; ``params[0]`` is the snippet anchor term."""
-        sql = _search_select_sql(_LIKE_SNIPPET_SQL, "messages m", where, order_by, limit_sql)
-        return [dict(row) for row in self._read_all(sql, params)]
+        # Apply session filters before reading large tool bodies. Otherwise SQLite can
+        # scan every message before rejecting the automated sessions at the join.
+        sql = _search_select_sql(_LIKE_SNIPPET_SQL, "messages m", where, order_by, limit_sql,
+                                 sessions_first=True)
+        return [dict(row) for row in self._search_read_all(sql, params)]
 
     @staticmethod
     def _compile_like_boolean_query(query: str) -> tuple[str, list[Any], Optional[str]]:
@@ -1156,10 +1184,12 @@ class SessionSearchMixin:
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> list[dict[str, Any]]:
         """:meth:`_search_messages_impl` plus one log line per slow search with the routing
         path taken. Threshold HERMES_SEARCH_SLOW_MS (default 1000; 0 logs every call)."""
         started = time.time()
+        token = _SEARCH_DEADLINE.set(None if timeout_seconds is None else time.monotonic() + timeout_seconds)
         rows = None
         try:
             rows = self._search_messages_impl(
@@ -1168,6 +1198,7 @@ class SessionSearchMixin:
                 after_ts=after_ts, before_ts=before_ts)
             return rows
         finally:
+            _SEARCH_DEADLINE.reset(token)
             elapsed_ms = (time.time() - started) * 1000.0
             if elapsed_ms >= _search_slow_ms():
                 logger.info("slow session search: path=%s elapsed=%.0fms rows=%s query=%r",
@@ -1220,7 +1251,7 @@ class SessionSearchMixin:
         else:
             sql, params = self._fts_match_sql("messages_fts", query, **route)
             try:
-                matches = [dict(row) for row in self._read_all(sql, params)]
+                matches = [dict(row) for row in self._search_read_all(sql, params)]
             except sqlite3.OperationalError:
                 return []  # FTS5 syntax error despite sanitization
             except sqlite3.DatabaseError as exc:
