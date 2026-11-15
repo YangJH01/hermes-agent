@@ -1038,7 +1038,7 @@ To roll back, first remove the `substring_index_version` readiness key; then dro
 the three `messages_fts_substring_insert`, `messages_fts_substring_update`, and
 `messages_fts_substring_delete` triggers, the `messages_fts_substring` virtual
 table, its `_src` view and the `substring_index_pending` table in one transaction.
-Also remove `substring_build_baseline` from `state_meta`. Freed pages are reusable;
+Also remove `substring_build_baseline` and `substring_index_stale` from `state_meta`. Freed pages are reusable;
 shrinking the database file requires a separately scheduled VACUUM.
 
 ### FTS5 query syntax
