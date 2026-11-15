@@ -351,6 +351,22 @@ def _hydrate_hit(db, lineage_root: str, match_info: dict[str, Any], result_detai
         detail=result_detail)
 
 
+def _discover_matches(db, query, role_filter, sort, after_ts, before_ts):
+    """Search both corpora completely, reserving candidates for actual conversations."""
+    rows = []
+    phases = (
+        (None, [*_HIDDEN_SESSION_SOURCES, *_DEMOTED_SESSION_SOURCES]),
+        (list(_DEMOTED_SESSION_SOURCES), list(_HIDDEN_SESSION_SOURCES)),
+    )
+    for sources, excluded in phases:
+        rows.extend(db.search_messages(
+            query=query, role_filter=role_filter or ["user", "assistant"],
+            source_filter=sources, exclude_sources=excluded, limit=_DISCOVER_SCAN_LIMIT,
+            offset=0, sort=sort, fields=_DISCOVER_SEARCH_FIELDS,
+            after_ts=after_ts, before_ts=before_ts))
+    return rows
+
+
 def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort: Optional[str],
               detail: str, current_session_id: str | None = None, link_profile: str | None = None,
               after_ts: Optional[int] = None, before_ts: Optional[int] = None,
@@ -366,12 +382,11 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
         title_started = _coerce_started_ts((_get_session_meta(db, title_root) or _get_session_meta(db, title_sid)).get("started_at"))
         if {title_sid, title_root} & excluded_roots or not _in_time_window(title_started, after_ts, before_ts):
             title_result = None
-    raw_results, err = _loud(lambda: db.search_messages(
-        query=query, role_filter=role_filter or ["user", "assistant"],
-        exclude_sources=list(_HIDDEN_SESSION_SOURCES), limit=_DISCOVER_SCAN_LIMIT, offset=0, sort=sort,
-        fields=_DISCOVER_SEARCH_FIELDS, after_ts=after_ts, before_ts=before_ts), "FTS5 search failed: %s", "Search failed")
+    searched, err = _loud(lambda: _discover_matches(db, query, role_filter, sort, after_ts, before_ts),
+                          "FTS5 search failed: %s", "Search failed")
     if err:
         return err
+    raw_results = searched
     # Demote cron rows below interactive ones BEFORE dedup so a high-volume cron corpus
     # can't starve the user's own sessions out of the top `limit`; stable sort keeps BM25
     # order within each class.

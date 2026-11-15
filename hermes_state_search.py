@@ -241,14 +241,17 @@ def _positive_int(name: str, value: Any) -> None:
         raise ValueError(f"{name} must be greater than zero")
 
 
-def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_by: str, limit_sql: str) -> str:
+def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_by: str, limit_sql: str,
+                       *, sessions_first: bool = False, candidates_first: bool = False) -> str:
     """Result-row SELECT shared by the FTS and LIKE routes (SQL text is pinned)."""
+    join = "CROSS JOIN" if candidates_first else "JOIN"
+    joined = ("sessions s CROSS JOIN messages m ON s.id = m.session_id" if sessions_first
+              else f"{from_sql} {join} sessions s ON s.id = m.session_id")
     return f"""
             SELECT m.id, m.session_id, m.role,
                    {snippet_sql},
                    {_SEARCH_SELECT_TAIL}
-            FROM {from_sql}
-            JOIN sessions s ON s.id = m.session_id
+            FROM {joined}
             WHERE {' AND '.join(where)}
             {order_by}
             {limit_sql}
@@ -626,6 +629,7 @@ class SessionSearchMixin:
                     "SELECT name FROM sqlite_master WHERE type = 'table' "
                     "AND (name LIKE 'messages_fts_%' ESCAPE '\\' "
                     "OR name LIKE 'messages_fts_trigram_%' ESCAPE '\\')"
+                    " AND name NOT LIKE 'messages_fts_substring%'"
                 ).fetchall():
                     conn.execute(f"ALTER TABLE {row[0]} RENAME TO fts_v22_trash_{row[0]}")
             # Claim the backfill BEFORE the empty v23 tables exist so a crash before
@@ -1053,33 +1057,32 @@ class SessionSearchMixin:
                 fail_open, exc)
             return None
 
-    def _like_rows(self, where: list[str], params: list, *, order_by: str, limit_sql: str) -> list[dict[str, Any]]:
+    def _like_rows(self, where: list[str], params: list, *, order_by: str, limit_sql: str,
+                   candidates: Optional[str] = None) -> list[dict[str, Any]]:
         """Canonical-table LIKE scan; ``params[0]`` is the snippet anchor term."""
-        sql = _search_select_sql(_LIKE_SNIPPET_SQL, "messages m", where, order_by, limit_sql)
+        from hermes_state_substring import INDEX, index_ready
+        if candidates and index_ready(self):
+            # Candidate membership is only a necessary condition. The unchanged LIKE
+            # predicate verifies bodies, columns, boolean logic and all visibility filters.
+            indexed_where = [f"m.id IN (SELECT rowid FROM {INDEX} WHERE {INDEX} MATCH ?)", *where]
+            # A source filter otherwise lets SQLite start from every cron session
+            # and probe the entire candidate list again for each session.
+            sql = _search_select_sql(_LIKE_SNIPPET_SQL, "messages m", indexed_where, order_by, limit_sql,
+                                     candidates_first=True)
+            try:
+                return [dict(row) for row in self._read_all(sql, [params[0], candidates, *params[1:]])]
+            except sqlite3.DatabaseError:
+                logger.warning("Compact substring index unavailable; using complete canonical search", exc_info=True)
+        sql = _search_select_sql(_LIKE_SNIPPET_SQL, "messages m", where, order_by, limit_sql,
+                                 sessions_first=True)
         return [dict(row) for row in self._read_all(sql, params)]
 
     @staticmethod
     def _compile_like_boolean_query(query: str) -> tuple[str, list[Any], Optional[str]]:
         """Compile the supported FTS boolean subset into LIKE predicates: terms within an OR
         group are ANDed (FTS5's implicit conjunction) and ``NOT`` negates the next term."""
-        groups: list[list[tuple[str, bool]]] = [[]]
-        negate_next = False
-        for raw_token in _LIKE_TOKEN_RE.findall(query):
-            operator = raw_token.upper()
-            if operator == "OR":
-                if groups[-1]:
-                    groups.append([])
-                negate_next = False
-                continue
-            if operator in {"AND", "NEAR"}:
-                continue
-            if operator == "NOT":
-                negate_next = True
-                continue
-            term = raw_token.strip('"').strip("*").strip()
-            if term:
-                groups[-1].append((term, negate_next))
-                negate_next = False
+        from hermes_state_substring import like_groups
+        groups = like_groups(query)
 
         compiled_groups: list[str] = []
         params: list[Any] = []
@@ -1099,6 +1102,7 @@ class SessionSearchMixin:
     def _search_messages_like_fallback(
         self, query: str, *, limit: int, offset: int, sort: Optional[str], **filters) -> list[dict[str, Any]]:
         """Search canonical messages while derived FTS state is stale."""
+        from hermes_state_substring import candidate_match, like_groups
         predicate, params, snippet_term = self._compile_like_boolean_query(query)
         if not predicate or snippet_term is None:
             return []
@@ -1106,7 +1110,8 @@ class SessionSearchMixin:
         _search_filter_clauses(where, params, **filters)
         order = "ASC" if isinstance(sort, str) and sort.strip().lower() == "oldest" else "DESC"
         return self._like_rows(where, [snippet_term, *params, limit, offset],
-                               order_by=f"ORDER BY m.timestamp {order}, m.id {order}", limit_sql="LIMIT ? OFFSET ?")
+                               order_by=f"ORDER BY m.timestamp {order}, m.id {order}", limit_sql="LIMIT ? OFFSET ?",
+                               candidates=candidate_match(like_groups(query)))
 
     def _refresh_fts_stale_state(self) -> None:
         """Observe fail-open initiated by another process sharing state.db."""
@@ -1287,9 +1292,12 @@ class SessionSearchMixin:
         filters = {k: route[k] for k in ("include_inactive", "source_filter", "exclude_sources", "role_filter",
                                          "after_ts", "before_ts")}
         _search_filter_clauses(like_where, like_params, **filters)
+        # This legacy route ORs its tokens; preserve that behavior in the prefilter.
+        from hermes_state_substring import candidate_match
+        candidates = candidate_match([[(term, False)] for term in non_op_tokens])
         # instr() for the snippet uses the first search token.
         return self._like_rows(like_where, [non_op_tokens[0], *like_params, route["limit"], route["offset"]],
-                               order_by="ORDER BY m.timestamp DESC", limit_sql="LIMIT ? OFFSET ?")
+                               order_by="ORDER BY m.timestamp DESC", limit_sql="LIMIT ? OFFSET ?", candidates=candidates)
 
     def _search_unindexed_gap(self, fts_query: str, limit: int, **filters) -> list[dict[str, Any]]:
         """LIKE-scan ids in (fts_rebuild_progress, fts_rebuild_high_water] — rows the deferred

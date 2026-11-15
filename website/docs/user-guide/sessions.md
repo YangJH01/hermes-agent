@@ -1009,6 +1009,38 @@ session_search()
 
 Returns recent sessions chronologically (titles, previews, timestamps). Useful when the user asks "what was I working on" without naming a topic.
 
+### Compact substring search (opt-in)
+
+For large stores that need full tool-output substring searches, this release branch
+provides an opt-in compact candidate index:
+
+```bash
+python -m hermes_state_substring /absolute/path/to/state.db --max-growth-mib 8192
+```
+
+Run it with the installation's Python. It resumes an interrupted build, indexes in
+small transactions, and never changes message bodies. The growth budget is enforced
+during construction, including across resumptions; it is not a lifetime storage
+quota. The index stores trigram/document membership without copies of bodies,
+positions, or per-document lengths. Its final size depends on the corpus.
+
+Search uses the index only after backfill and structural validation complete.
+Candidate matches are checked against the original full-body LIKE predicate,
+including boolean operators and source, role, time and visibility filters. Terms
+too short for a trigram, or an unavailable index, retain complete canonical scans;
+these broad searches can still be slow. Discovery no longer cuts off either corpus
+after two or three seconds. Existing result-count limits still apply.
+
+SQLite triggers maintain the index in the same transaction as message inserts,
+content edits and deletions. Metadata-only changes and unchanged body updates do
+not re-index it. Monitor actual index size and write latency after enabling it.
+To roll back, first remove the `substring_index_version` readiness key; then drop
+the three `messages_fts_substring_insert`, `messages_fts_substring_update`, and
+`messages_fts_substring_delete` triggers, the `messages_fts_substring` virtual
+table, its `_src` view and the `substring_index_pending` table in one transaction.
+Also remove `substring_build_baseline` and `substring_index_stale` from `state_meta`. Freed pages are reusable;
+shrinking the database file requires a separately scheduled VACUUM.
+
 ### FTS5 query syntax
 
 The keyword mode supports standard FTS5 query syntax:
