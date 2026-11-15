@@ -242,10 +242,11 @@ def _positive_int(name: str, value: Any) -> None:
 
 
 def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_by: str, limit_sql: str,
-                       *, sessions_first: bool = False) -> str:
+                       *, sessions_first: bool = False, candidates_first: bool = False) -> str:
     """Result-row SELECT shared by the FTS and LIKE routes (SQL text is pinned)."""
+    join = "CROSS JOIN" if candidates_first else "JOIN"
     joined = ("sessions s CROSS JOIN messages m ON s.id = m.session_id" if sessions_first
-              else f"{from_sql} JOIN sessions s ON s.id = m.session_id")
+              else f"{from_sql} {join} sessions s ON s.id = m.session_id")
     return f"""
             SELECT m.id, m.session_id, m.role,
                    {snippet_sql},
@@ -1064,7 +1065,10 @@ class SessionSearchMixin:
             # Candidate membership is only a necessary condition. The unchanged LIKE
             # predicate verifies bodies, columns, boolean logic and all visibility filters.
             indexed_where = [f"m.id IN (SELECT rowid FROM {INDEX} WHERE {INDEX} MATCH ?)", *where]
-            sql = _search_select_sql(_LIKE_SNIPPET_SQL, "messages m", indexed_where, order_by, limit_sql)
+            # A source filter otherwise lets SQLite start from every cron session
+            # and probe the entire candidate list again for each session.
+            sql = _search_select_sql(_LIKE_SNIPPET_SQL, "messages m", indexed_where, order_by, limit_sql,
+                                     candidates_first=True)
             try:
                 return [dict(row) for row in self._read_all(sql, [params[0], candidates, *params[1:]])]
             except sqlite3.DatabaseError:

@@ -97,3 +97,33 @@ def test_corrupt_substring_index_cannot_prevent_message_storage(seeded):
     mid = db.append_message("chat", role="user", content="durable despite a broken search index")
     assert any(row["id"] == mid for row in db.get_messages("chat"))
     assert not index_ready(db)
+
+
+def test_source_filtered_candidates_do_not_multiply_session_work(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    for i in range(600):
+        sid = f"scheduled-{i}"
+        db.create_session(sid, source="cron")
+        db.append_message(sid, role="tool", content="sharedneedle")
+    expected = db.search_messages("sharedneedle", source_filter=["cron"], role_filter=["tool"],
+                                  fields=("id", "snippet"), sort="newest")
+    build_index(path)
+    db.close()
+    reader = SessionDB(path, read_only=True)
+    steps = 0
+
+    def budget():
+        nonlocal steps
+        steps += 1000
+        return int(steps > 200_000)
+
+    # Bound VM work, not wall time: starting from every session multiplies the
+    # candidate list by the session count, despite returning the same twenty rows.
+    reader._conn.set_progress_handler(budget, 1000)
+    try:
+        assert reader.search_messages("sharedneedle", source_filter=["cron"], role_filter=["tool"],
+                                      fields=("id", "snippet"), sort="newest") == expected
+    finally:
+        reader._conn.set_progress_handler(None, 0)
+        reader.close()
