@@ -297,6 +297,8 @@ class SessionFtsSetupMixin:
 
     @staticmethod
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
+        from hermes_state_substring import detach_index
+        detach_index(cursor)
         for trigger in _FTS_TRIGGERS:
             try:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")

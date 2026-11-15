@@ -41,8 +41,6 @@ _READ_MAX_CONTENT = 2000
 # FTS rows scanned before dedup-by-lineage — well above the distinct sessions a query
 # returns, so interactive matches buried under cron hits survive the demotion pass.
 _DISCOVER_SCAN_LIMIT = 300
-_DISCOVER_INTERACTIVE_SECONDS = 3.0
-_DISCOVER_CRON_SECONDS = 2.0
 # exclude_session_ids: ids already inspected this task; capped so a runaway list can't fan out lineage walks.
 _EXCLUDE_SESSION_IDS_CAP = 20
 # Relative time bounds: "7d" / "24h" / "2w" = now minus N hours/days/weeks.
@@ -354,28 +352,19 @@ def _hydrate_hit(db, lineage_root: str, match_info: dict[str, Any], result_detai
 
 
 def _discover_matches(db, query, role_filter, sort, after_ts, before_ts):
-    """Reserve time and candidates for conversations before searching bulky cron history."""
-    rows, timed_out = [], []
+    """Search both corpora completely, reserving candidates for actual conversations."""
+    rows = []
     phases = (
-        ("conversations", None, [*_HIDDEN_SESSION_SOURCES, *_DEMOTED_SESSION_SOURCES], _DISCOVER_INTERACTIVE_SECONDS),
-        ("scheduled jobs", list(_DEMOTED_SESSION_SOURCES), list(_HIDDEN_SESSION_SOURCES), _DISCOVER_CRON_SECONDS),
+        (None, [*_HIDDEN_SESSION_SOURCES, *_DEMOTED_SESSION_SOURCES]),
+        (list(_DEMOTED_SESSION_SOURCES), list(_HIDDEN_SESSION_SOURCES)),
     )
-    for label, sources, excluded, seconds in phases:
-        try:
-            rows.extend(db.search_messages(
-                query=query, role_filter=role_filter or ["user", "assistant"],
-                source_filter=sources, exclude_sources=excluded, limit=_DISCOVER_SCAN_LIMIT,
-                offset=0, sort=sort, fields=_DISCOVER_SEARCH_FIELDS,
-                after_ts=after_ts, before_ts=before_ts, timeout_seconds=seconds))
-        except TimeoutError:
-            timed_out.append(label)
-    incomplete = {} if not timed_out else {
-        "incomplete": True,
-        "message": (f"Search time budget reached for {', '.join(timed_out)}. Available matches are shown; "
-                    "this is not evidence that other records do not exist. Use a known session_id to read "
-                    "directly, or refine keywords/date bounds when appropriate; do not repeat the same broad search."),
-    }
-    return rows, incomplete
+    for sources, excluded in phases:
+        rows.extend(db.search_messages(
+            query=query, role_filter=role_filter or ["user", "assistant"],
+            source_filter=sources, exclude_sources=excluded, limit=_DISCOVER_SCAN_LIMIT,
+            offset=0, sort=sort, fields=_DISCOVER_SEARCH_FIELDS,
+            after_ts=after_ts, before_ts=before_ts))
+    return rows
 
 
 def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort: Optional[str],
@@ -397,15 +386,13 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
                           "FTS5 search failed: %s", "Search failed")
     if err:
         return err
-    raw_results, incomplete = searched
+    raw_results = searched
     # Demote cron rows below interactive ones BEFORE dedup so a high-volume cron corpus
     # can't starve the user's own sessions out of the top `limit`; stable sort keeps BM25
     # order within each class.
     raw_results = sorted(raw_results, key=lambda r: (r.get("source") or "") in _DEMOTED_SESSION_SOURCES)
     # See #19434.
     if not raw_results and not title_result:
-        if incomplete:
-            return _discover_payload(db, query, detail, [], **incomplete)
         return _discover_payload(db, query, detail, [], message=(
             "No matching sessions found. FTS5 ANDs all terms by default — "
             "broaden with OR (`alpha OR beta`), exact-match with quoted "
@@ -451,7 +438,7 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
             results.append(entry)
     for entry in results:
         entry["link"] = _session_link(entry["session_id"], link_profile)
-    return _discover_payload(db, query, detail, results, **incomplete, sessions_searched=len(seen_sessions), link_hint=(
+    return _discover_payload(db, query, detail, results, sessions_searched=len(seen_sessions), link_hint=(
         "When referring the user to a session, write its `link` value "
         "verbatim inline mid-sentence (it renders as a titled link) — never "
         "as markdown, in backticks, on its own line, or next to the "
